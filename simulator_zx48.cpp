@@ -1267,8 +1267,13 @@ struct CPUZ80 {
                 return 23;
             }
 
-            // Indexed 16-bit loads/stores and stack operations.
+            // --- ПОЛНАЯ ПОДДЕРЖКА ДОКУМЕНТИРОВАННЫХ И НЕДОКУМЕНТИРОВАННЫХ КОМАНД IX/IY ---
             WORD& index = use_iy ? IY : IX;
+
+            // Выделяем ссылки на половинки регистров для недокументированных опкодов
+            BYTE& index_h = use_iy ? *(BYTE*)((BYTE*)&IY + 1) : *(BYTE*)((BYTE*)&IX + 1);
+            BYTE& index_l = use_iy ? *(BYTE*)((BYTE*)&IY) : *(BYTE*)((BYTE*)&IX);
+
             if (subOp == 0x21) {
                 WORD l = ReadByte(PC++), h = ReadByte(PC++);
                 index = (WORD)((h << 8) | l);
@@ -1412,9 +1417,58 @@ struct CPUZ80 {
                 return 19;
             }
 
-            // The common register forms of DD/FD are officially ignored as
-            // prefixes by the Z80; for the ROM paths we care about, returning
-            // the base instruction timing is sufficient.
+            // --- ИСПРАВЛЕНО: ДЕКОДИРОВАНИЕ НЕДОКУМЕНТИРОВАННЫХ ОПКОДОВ ДЛЯ ПОЛОВИНОК IX/IY ---
+            // Сюда попадает ваш опкод 0x54 (LD D, IXH) и все операции ALU над половинками регистров
+            {
+                BYTE destReg = (subOp >> 3) & 7;
+                BYTE srcReg = subOp & 7;
+
+                // Перенаправление обращений к H/L на половинки IXH/IXL (или IYH/IYL)
+                auto get_val = [&](BYTE reg) -> BYTE {
+                    if (reg == 0) return B; if (reg == 1) return C; if (reg == 2) return D; if (reg == 3) return E;
+                    if (reg == 4) return index_h; // Вместо H читаем старшую половинку индекса
+                    if (reg == 5) return index_l; // Вместо L читаем младшую половинку индекса
+                    if (reg == 7) return A;
+                    return 0;
+                    };
+
+                // Одиночные операции INC/DEC над половинками регистров (0x24, 0x25, 0x2C, 0x2D)
+                if ((subOp & 0xC7) == 0x04) {
+                    BYTE r = (subOp >> 3) & 7;
+                    if (r == 4) { INC_REG(index_h); } if (r == 5) { INC_REG(index_l); }
+                }
+                if ((subOp & 0xC7) == 0x05) {
+                    BYTE r = (subOp >> 3) & 7;
+                    if (r == 4) { DEC_REG(index_h); } if (r == 5) { DEC_REG(index_l); }
+                }
+
+                // Команды типа LD r, r' над половинками регистров
+                if ((subOp & 0xC0) == 0x40) {
+                    BYTE val = get_val(srcReg);
+                    if (destReg == 0) B = val; else if (destReg == 1) C = val;
+                    else if (destReg == 2) D = val; else if (destReg == 3) E = val;
+                    else if (destReg == 4) index_h = val; else if (destReg == 5) index_l = val;
+                    else if (destReg == 7) A = val;
+                    return 4;
+                }
+
+                // Операции ALU над половинками регистров (ADD, SUB, AND, CP и т.д.)
+                if ((subOp & 0xC0) == 0x80) {
+                    BYTE val = get_val(srcReg);
+                    switch ((subOp >> 3) & 7) {
+                    case 0: ALU_ADD(val); break; case 1: ALU_ADC(val); break;
+                    case 2: ALU_SUB(val); break; case 3: ALU_SBC(val); break;
+                    case 4: ALU_AND(val); break; case 5: ALU_XOR(val); break;
+                    case 6: ALU_OR(val); break;  case 7: ALU_CP(val); break;
+                    }
+                    return 4;
+                }
+
+                // Опкоды загрузки непосредственного значения типа LD IXH, n
+                if (subOp == 0x26) { index_h = ReadByte(PC++); return 7; }
+                if (subOp == 0x2E) { index_l = ReadByte(PC++); return 7; }
+            }
+
             return 4;
         }
 
