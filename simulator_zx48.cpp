@@ -1166,6 +1166,14 @@ struct CPUZ80 {
                 BYTE val = ReadByte(GetHL()); OutPort(GetBC(), val); B--; SetHL(GetHL() + 1);
                 F = F_N | (B == 0 ? F_Z : 0) | (B & 0x80 ? F_S : 0); if (subOp == 0xB3 && B != 0) { PC -= 2; return 21; } return 16;
             }
+            case 0xAA: case 0xBA: { // IND / INDR
+                BYTE val = InPort(GetBC()); WriteByte(GetHL(), val); B--; SetHL(GetHL() - 1);
+                F = F_N | (B == 0 ? F_Z : 0) | (B & 0x80 ? F_S : 0); if (subOp == 0xBA && B != 0) { PC -= 2; return 21; } return 16;
+            }
+            case 0xAB: case 0xBB: { // OUTD / OTDR
+                BYTE val = ReadByte(GetHL()); OutPort(GetBC(), val); B--; SetHL(GetHL() - 1);
+                F = F_N | (B == 0 ? F_Z : 0) | (B & 0x80 ? F_S : 0); if (subOp == 0xBB && B != 0) { PC -= 2; return 21; } return 16;
+            }
             case 0x44: { // NEG
                 BYTE old_a = A;
                 A = 0 - A;
