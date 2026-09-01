@@ -1,10 +1,8 @@
-﻿#define _CRT_SECURE_NO_WARNINGS
-#define UNICODE
+﻿#define UNICODE
 #define _UNICODE
 #include <windows.h>
 #include <mmsystem.h>
 #include <fstream>
-#include <vector>
 
 #pragma comment(lib, "winmm.lib")
 
@@ -24,7 +22,8 @@ bool emulator_running = true;
 static DWORD pixel_buffer[256 * 192];
 
 // --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ ЭМУЛЯЦИИ ЛЕНТЫ ---
-std::vector<BYTE> current_tap_data; // Буфер текущего TAP-файла
+BYTE*  current_tap_data = nullptr; // Буфер текущего TAP-файла
+size_t current_tap_size = 0;       // Размер текущего TAP-файла
 size_t tap_current_pos = 0;         // Текущая позиция чтения в TAP
 bool tap_is_loaded = false;         // Флаг, загружена ли "лента" в эмулятор
 
@@ -602,11 +601,11 @@ struct CPUZ80 {
             // DE - ожидаемая длина блока
             // IX - адрес в памяти, куда загружать данные
 
-            if (tap_current_pos + 2 <= current_tap_data.size()) {
+            if (tap_current_pos + 2 <= current_tap_size) {
                 // Читаем длину следующего блока из TAP файла
                 WORD block_len = current_tap_data[tap_current_pos] | (current_tap_data[tap_current_pos + 1] << 8);
 
-                if (tap_current_pos + 2 + block_len <= current_tap_data.size()) {
+                if (tap_current_pos + 2 + block_len <= current_tap_size) {
                     size_t block_start = tap_current_pos + 2;
                     BYTE flag = current_tap_data[block_start];
 
@@ -1723,279 +1722,323 @@ static WORD ReadLE16(const BYTE* p) {
     return (WORD)p[0] | ((WORD)p[1] << 8);
 }
 
-static bool LoadSnaSnapshot(const std::vector<BYTE>& data, std::wstring& error) {
-    if (data.size() != 49179) {
-        error = L"Поддерживается только 48K .SNA (49179 байт). "
-                L"128K .SNA в этом 48K эмуляторе не поддерживается.";
-        return false;
-    }
+static bool LoadSnaSnapshot(const BYTE* data, size_t data_size, const wchar_t*& error) {
+	// Проверяем точный размер для 48K SNA
+	if (data_size != 49179) {
+		error = L"Поддерживается только 48K .SNA (49179 байт). "
+			L"128K .SNA в этом 48K эмуляторе не поддерживается.";
+		return false;
+	}
 
-    const BYTE* h = data.data();
-    cpu.Reset();
-    spec_speaker_state = false;
-    ay.Reset();
+	const BYTE* h = data;
+	cpu.Reset();
+	spec_speaker_state = false;
+	ay.Reset();
 
-    cpu.I = h[0];
-    cpu.L_alt = h[1]; cpu.H_alt = h[2];
-    cpu.E_alt = h[3]; cpu.D_alt = h[4];
-    cpu.C_alt = h[5]; cpu.B_alt = h[6];
-    cpu.F_alt = h[7]; cpu.A_alt = h[8];
+	cpu.I = h[0];
+	cpu.L_alt = h[1]; cpu.H_alt = h[2];
+	cpu.E_alt = h[3]; cpu.D_alt = h[4];
+	cpu.C_alt = h[5]; cpu.B_alt = h[6];
+	cpu.F_alt = h[7]; cpu.A_alt = h[8];
 
-    cpu.L = h[9];  cpu.H = h[10];
-    cpu.E = h[11]; cpu.D = h[12];
-    cpu.C = h[13]; cpu.B = h[14];
-    cpu.IY = ReadLE16(h + 15);
-    cpu.IX = ReadLE16(h + 17);
-    cpu.IFF1 = (h[19] & 0x04) != 0;
-    cpu.IFF2 = cpu.IFF1;
-    cpu.R = h[20];
-    cpu.F = h[21];
-    cpu.A = h[22];
-    cpu.SP = ReadLE16(h + 23);
-    cpu.IM = (BYTE)(h[25] & 0x03);
-    if (cpu.IM > 2) cpu.IM = 2;
+	cpu.L = h[9];  cpu.H = h[10];
+	cpu.E = h[11]; cpu.D = h[12];
+	cpu.C = h[13]; cpu.B = h[14];
+	cpu.IY = ReadLE16(h + 15);
+	cpu.IX = ReadLE16(h + 17);
+	cpu.IFF1 = (h[19] & 0x04) != 0;
+	cpu.IFF2 = cpu.IFF1;
+	cpu.R = h[20];
+	cpu.F = h[21];
+	cpu.A = h[22];
+	cpu.SP = ReadLE16(h + 23);
+	cpu.IM = (BYTE)(h[25] & 0x03);
+	if (cpu.IM > 2) cpu.IM = 2;
 
-    spec_border_color = h[26] & 0x07;
+	spec_border_color = h[26] & 0x07;
 
-    for (size_t i = 0; i < 49152; ++i)
-        spec_ram[i] = data[27 + i];
+	// Копирование 48 КБ памяти напрямую из буфера файла
+	for (size_t i = 0; i < 49152; ++i) {
+		spec_ram[i] = data[27 + i];
+	}
 
-    // In a 48K SNA the PC is stored on the stack. Loading it is equivalent
-    // to executing RETN immediately after restoring the snapshot.
-    if (cpu.SP < 0x4000) {
-        error = L"Некорректный .SNA: SP указывает в ПЗУ.";
-        return false;
-    }
+	// В формате SNA (48K) регистр PC хранится на стеке.
+	// Извлечение PC эквивалентно выполнению инструкции RETN сразу после загрузки.
+	if (cpu.SP < 0x4000) {
+		error = L"Некорректный .SNA: SP указывает в ПЗУ.";
+		return false;
+	}
 
-    size_t ram_offset = (size_t)(cpu.SP - 0x4000);
-    if (ram_offset + 1 >= 49152) {
-        error = L"Некорректный .SNA: PC на стеке выходит за пределы RAM.";
-        return false;
-    }
+	size_t ram_offset = (size_t)(cpu.SP - 0x4000);
+	if (ram_offset + 1 >= 49152) {
+		error = L"Некорректный .SNA: PC на стеке выходит за пределы RAM.";
+		return false;
+	}
 
-    cpu.PC = (WORD)spec_ram[ram_offset] |
-             ((WORD)spec_ram[ram_offset + 1] << 8);
-    cpu.SP = (WORD)(cpu.SP + 2);
+	cpu.PC = (WORD)spec_ram[ram_offset] |
+		((WORD)spec_ram[ram_offset + 1] << 8);
+	cpu.SP = (WORD)(cpu.SP + 2);
 
-    cpu.halted = false;
-    cpu.int_pending = false;
-    cpu.ei_delay_counter = 0;
-    cpu.cycles_until_interrupt = 70000;
-    return true;
+	cpu.halted = false;
+	cpu.int_pending = false;
+	cpu.ei_delay_counter = 0;
+	cpu.cycles_until_interrupt = 70000;
+	return true;
 }
+
 
 static bool DecompressZ80(const BYTE* src, size_t src_size,
-                          std::vector<BYTE>& out, size_t expected_size,
-                          bool old_format) {
-    out.clear();
-    out.reserve(expected_size);
+	BYTE* dest, size_t expected_size,
+	bool old_format) {
+	size_t dest_size = 0; // Заменяет out.size()
+	size_t p = 0;
 
-    size_t p = 0;
-    while (p < src_size && out.size() < expected_size) {
-        if (old_format && p + 4 <= src_size &&
-            src[p] == 0x00 && src[p + 1] == 0xED &&
-            src[p + 2] == 0xED && src[p + 3] == 0x00) {
-            break;
-        }
+	while (p < src_size && dest_size < expected_size) {
+		// Проверка на маркер конца в старом формате v1
+		if (old_format && p + 4 <= src_size &&
+			src[p] == 0x00 && src[p + 1] == 0xED &&
+			src[p + 2] == 0xED && src[p + 3] == 0x00) {
+			break;
+		}
 
-        if (p + 4 <= src_size &&
-            src[p] == 0xED && src[p + 1] == 0xED) {
-            BYTE count = src[p + 2];
-            BYTE value = src[p + 3];
-            if (count == 0 || out.size() + count > expected_size)
-                return false;
-            out.insert(out.end(), count, value);
-            p += 4;
-        } else {
-            out.push_back(src[p++]);
-        }
-    }
+		// Проверка на RLE-сжатую последовательность (0xED, 0xED, повторения, байт)
+		if (p + 4 <= src_size &&
+			src[p] == 0xED && src[p + 1] == 0xED) {
 
-    return out.size() == expected_size;
+			BYTE count = src[p + 2];
+			BYTE value = src[p + 3];
+
+			if (count == 0 || dest_size + count > expected_size)
+				return false;
+
+			// Замена out.insert(...) -> заполняем массив циклом
+			for (BYTE i = 0; i < count; ++i) {
+				dest[dest_size++] = value;
+			}
+			p += 4;
+		}
+		else {
+			// Замена out.push_back(...) -> пишем одиночный байт напрямую
+			dest[dest_size++] = src[p++];
+		}
+	}
+
+	// Возвращаем true, если распаковалось ровно столько байт, сколько ожидалось
+	return dest_size == expected_size;
 }
 
-static bool LoadZ80Snapshot(const std::vector<BYTE>& data, std::wstring& error) {
-    if (data.size() < 30) {
-        error = L"Файл .Z80 слишком короткий.";
-        return false;
-    }
 
-    const BYTE* h = data.data();
-    cpu.Reset();
-    spec_speaker_state = false;
-    ay.Reset();
+// Предполагается, что DecompressZ80 теперь принимает прямой указатель на целевой буфер:
+// bool DecompressZ80(const BYTE* src, size_t src_len, BYTE* dest, size_t dest_len, bool zero_init);
 
-    cpu.A = h[0];
-    cpu.F = h[1];
-    cpu.SetBC(ReadLE16(h + 2));
-    cpu.SetHL(ReadLE16(h + 4));
+static bool LoadZ80Snapshot(const BYTE* data, size_t data_size, const wchar_t*& error) {
+	if (data_size < 30) {
+		error = L"Файл .Z80 слишком короткий.";
+		return false;
+	}
 
-    WORD pc_header = ReadLE16(h + 6);
-    cpu.SP = ReadLE16(h + 8);
-    cpu.I = h[10];
-    cpu.R = (BYTE)((h[11] & 0x7F) | ((h[12] & 0x01) << 7));
-    spec_border_color = (h[12] >> 1) & 0x07;
+	const BYTE* h = data;
+	cpu.Reset();
+	spec_speaker_state = false;
+	ay.Reset();
 
-    cpu.SetDE(ReadLE16(h + 13));
-    cpu.C_alt = h[15]; cpu.B_alt = h[16];
-    cpu.E_alt = h[17]; cpu.D_alt = h[18];
-    cpu.L_alt = h[19]; cpu.H_alt = h[20];
-    cpu.A_alt = h[21]; cpu.F_alt = h[22];
-    cpu.IY = ReadLE16(h + 23);
-    cpu.IX = ReadLE16(h + 25);
-    cpu.IFF1 = h[27] != 0;
-    cpu.IFF2 = h[28] != 0;
-    cpu.IM = (BYTE)(h[29] & 0x03);
-    if (cpu.IM > 2) cpu.IM = 2;
+	cpu.A = h[0];
+	cpu.F = h[1];
+	cpu.SetBC(ReadLE16(h + 2));
+	cpu.SetHL(ReadLE16(h + 4));
 
-    if (pc_header != 0) {
-        // Z80 v1: one 48K RAM image.
-        const bool compressed = (h[12] & 0x20) != 0;
-        std::vector<BYTE> ram;
+	WORD pc_header = ReadLE16(h + 6);
+	cpu.SP = ReadLE16(h + 8);
+	cpu.I = h[10];
+	cpu.R = (BYTE)((h[11] & 0x7F) | ((h[12] & 0x01) << 7));
+	spec_border_color = (h[12] >> 1) & 0x07;
 
-        if (compressed) {
-            if (!DecompressZ80(data.data() + 30, data.size() - 30,
-                               ram, 49152, true)) {
-                error = L"Не удалось распаковать RAM из .Z80 v1.";
-                return false;
-            }
-        } else {
-            if (data.size() < 30 + 49152) {
-                error = L"Файл .Z80 v1 не содержит полные 48 КБ RAM.";
-                return false;
-            }
-            ram.assign(data.begin() + 30, data.begin() + 30 + 49152);
-        }
+	cpu.SetDE(ReadLE16(h + 13));
+	cpu.C_alt = h[15]; cpu.B_alt = h[16];
+	cpu.E_alt = h[17]; cpu.D_alt = h[18];
+	cpu.L_alt = h[19]; cpu.H_alt = h[20];
+	cpu.A_alt = h[21]; cpu.F_alt = h[22];
+	cpu.IY = ReadLE16(h + 23);
+	cpu.IX = ReadLE16(h + 25);
+	cpu.IFF1 = h[27] != 0;
+	cpu.IFF2 = h[28] != 0;
+	cpu.IM = (BYTE)(h[29] & 0x03);
+	if (cpu.IM > 2) cpu.IM = 2;
 
-        std::copy(ram.begin(), ram.end(), spec_ram);
-        cpu.PC = pc_header;
-    } else {
-        // Z80 v2/v3: additional header + 16K memory blocks.
-        if (data.size() < 32) {
-            error = L"Файл .Z80 v2/v3 не содержит дополнительный заголовок.";
-            return false;
-        }
+	if (pc_header != 0) {
+		// Z80 v1: one 48K RAM image.
+		const bool compressed = (h[12] & 0x20) != 0;
 
-        WORD ext_len = ReadLE16(data.data() + 30);
-        if (ext_len < 23 || 32u + ext_len > data.size()) {
-            error = L"Некорректная длина дополнительного заголовка .Z80.";
-            return false;
-        }
+		if (compressed) {
+			// Распаковываем напрямую в spec_ram без промежуточного std::vector
+			if (!DecompressZ80(data + 30, data_size - 30, spec_ram, 49152, true)) {
+				error = L"Не удалось распаковать RAM из .Z80 v1.";
+				return false;
+			}
+		}
+		else {
+			if (data_size < 30 + 49152) {
+				error = L"Файл .Z80 v1 не содержит полные 48 КБ RAM.";
+				return false;
+			}
+			// Замена std::copy на циклическое копирование байт
+			for (size_t i = 0; i < 49152; ++i) {
+				spec_ram[i] = data[30 + i];
+			}
+		}
 
-        const BYTE* ext = data.data() + 32;
-        cpu.PC = ReadLE16(ext);
-        BYTE machine = ext[2];
+		cpu.PC = pc_header;
+	}
+	else {
+		// Z80 v2/v3: additional header + 16K memory blocks.
+		if (data_size < 32) {
+			error = L"Файл .Z80 v2/v3 не содержит дополнительный заголовок.";
+			return false;
+		}
 
-        // Hardware modes 0 and 1 are 48K modes. This emulator is 48K-only.
-        if (machine > 1) {
-            error = L"Этот эмулятор поддерживает .Z80 только для ZX Spectrum 48K.";
-            return false;
-        }
-        if (cpu.PC == 0) {
-            error = L"Некорректный .Z80: PC в дополнительном заголовке равен 0.";
-            return false;
-        }
+		WORD ext_len = ReadLE16(data + 30);
+		if (ext_len < 23 || 32u + ext_len > data_size) {
+			error = L"Некорректная длина дополнительного заголовка .Z80.";
+			return false;
+		}
 
-        std::fill(spec_ram, spec_ram + 49152, 0);
-        bool page_seen[3] = { false, false, false };
-        size_t pos = 32u + ext_len;
+		const BYTE* ext = data + 32;
+		cpu.PC = ReadLE16(ext);
+		BYTE machine = ext[2];
 
-        while (pos + 3 <= data.size()) {
-            WORD block_len = ReadLE16(data.data() + pos);
-            BYTE page = data[pos + 2];
-            pos += 3;
+		// Hardware modes 0 and 1 are 48K modes. This emulator is 48K-only.
+		if (machine > 1) {
+			error = L"Этот эмулятор поддерживает .Z80 только для ZX Spectrum 48K.";
+			return false;
+		}
+		if (cpu.PC == 0) {
+			error = L"Некорректный .Z80: PC в дополнительном заголовке равен 0.";
+			return false;
+		}
 
-            size_t target_offset = 0;
-            int page_index = -1;
+		// Замена std::fill на обычный цикл для очистки памяти
+		for (size_t i = 0; i < 49152; ++i) {
+			spec_ram[i] = 0;
+		}
 
-            // 48K Z80 pages: 8 = 4000, 4 = 8000, 5 = C000.
-            if (page == 8) {
-                target_offset = 0;
-                page_index = 0;
-            } else if (page == 4) {
-                target_offset = 16384;
-                page_index = 1;
-            } else if (page == 5) {
-                target_offset = 32768;
-                page_index = 2;
-            }
+		bool page_seen[3] = { false, false, false };
+		size_t pos = 32u + ext_len;
 
-            size_t stored_size =
-                (block_len == 0xFFFF) ? 16384u : (size_t)block_len;
+		while (pos + 3 <= data_size) {
+			WORD block_len = ReadLE16(data + pos);
+			BYTE page = data[pos + 2];
+			pos += 3;
 
-            if (pos + stored_size > data.size()) {
-                error = L"Повреждённый блок RAM в .Z80.";
-                return false;
-            }
+			size_t target_offset = 0;
+			int page_index = -1;
 
-            if (page_index < 0) {
-                pos += stored_size;
-                continue;
-            }
+			// 48K Z80 pages: 8 = 4000, 4 = 8000, 5 = C000.
+			if (page == 8) {
+				target_offset = 0;
+				page_index = 0;
+			}
+			else if (page == 4) {
+				target_offset = 16384;
+				page_index = 1;
+			}
+			else if (page == 5) {
+				target_offset = 32768;
+				page_index = 2;
+			}
 
-            std::vector<BYTE> block;
-            if (block_len == 0xFFFF) {
-                block.assign(data.begin() + pos,
-                             data.begin() + pos + 16384);
-            } else if (!DecompressZ80(data.data() + pos, block_len,
-                                      block, 16384, false)) {
-                error = L"Не удалось распаковать блок RAM в .Z80.";
-                return false;
-            }
+			size_t stored_size = (block_len == 0xFFFF) ? 16384u : (size_t)block_len;
 
-            std::copy(block.begin(), block.end(),
-                      spec_ram + target_offset);
-            page_seen[page_index] = true;
-            pos += stored_size;
-        }
+			if (pos + stored_size > data_size) {
+				error = L"Повреждённый блок RAM в .Z80.";
+				return false;
+			}
 
-        if (!page_seen[0] || !page_seen[1] || !page_seen[2]) {
-            error = L"В .Z80 отсутствует один или несколько блоков 48K RAM.";
-            return false;
-        }
-    }
+			if (page_index < 0) {
+				pos += stored_size;
+				continue;
+			}
 
-    cpu.halted = false;
-    cpu.int_pending = false;
-    cpu.ei_delay_counter = 0;
-    cpu.cycles_until_interrupt = 70000;
-    return true;
+			if (block_len == 0xFFFF) {
+				// Замена std::copy на обычный цикл (копируем несжатые 16КБ в нужный сектор spec_ram)
+				for (size_t i = 0; i < 16384; ++i) {
+					spec_ram[target_offset + i] = data[pos + i];
+				}
+			}
+			else {
+				// Распаковываем блок напрямую в нужный участок spec_ram
+				if (!DecompressZ80(data + pos, block_len, spec_ram + target_offset, 16384, false)) {
+					error = L"Не удалось распаковать блок RAM в .Z80.";
+					return false;
+				}
+			}
+
+			page_seen[page_index] = true;
+			pos += stored_size;
+		}
+
+		if (!page_seen[0] || !page_seen[1] || !page_seen[2]) {
+			error = L"В .Z80 отсутствует один или несколько блоков 48K RAM.";
+			return false;
+		}
+	}
+
+	cpu.halted = false;
+	cpu.int_pending = false;
+	cpu.ei_delay_counter = 0;
+	cpu.cycles_until_interrupt = 70000;
+	return true;
 }
 
-static bool LoadTapFile(const std::vector<BYTE>& data, std::wstring& error) {
-    if (data.empty()) {
-        error = L"Файл TAP пуст.";
-        return false;
-    }
+static bool LoadTapFile(const BYTE* data, size_t data_size, const wchar_t*& error) {
+	if (data == nullptr || data_size == 0) {
+		error = L"Файл TAP пуст.";
+		return false;
+	}
 
-    // Сохраняем образ ленты в глобальную память эмулятора
-    current_tap_data = data;
-    tap_current_pos = 0;
-    tap_is_loaded = true;
+	// Освобождаем старый образ ленты, если он был загружен ранее
+	if (current_tap_data != nullptr) {
+		HeapFree(GetProcessHeap(), 0, current_tap_data);
+		current_tap_data = nullptr;
+	}
 
-    // Полный аппаратный сброс всей системы
-    cpu.Reset();
-    std::fill(spec_ram, spec_ram + 49152, 0);
-    ay.Reset();
+	// Выделяем память под новый образ ленты в куче Windows
+	current_tap_data = (BYTE*)HeapAlloc(GetProcessHeap(), 0, data_size);
+	if (current_tap_data == nullptr) {
+		error = L"Недостаточно памяти для загрузки TAP файла.";
+		return false;
+	}
 
-    // Инициализируем клавиатурную матрицу по умолчанию
-    for (int i = 0; i < 8; i++) {
-        spec_key_rows[i] = 0x1F;
-        physical_key_rows[i] = 0x1F;
-        gui_key_rows[i] = 0x1F;
-    }
+	// Копируем данные во внутренний буфер эмулятора через простой цикл
+	for (size_t i = 0; i < data_size; ++i) {
+		current_tap_data[i] = data[i];
+	}
 
-    // Эмуляция автоматического ввода команды LOAD "" после старта ПЗУ.
-    // Для этого мы напрямую закидываем символы в системный буфер клавиатуры Spectrum (адрес 0x5C6A)
-    // Это гарантирует, что эмулятор сам нажмет кнопку "J" (LOAD) и кавычки.
-    // Данные пишутся в область системных переменных Spectrum (ОЗУ инициализируется ПЗУ через пару кадров)
-    // Чтобы симуляция нажатия сработала наверняка через внутренние процедуры ROM, 
-    // мы добавим задержку: просто дадим ПЗУ Spectrum загрузиться штатно до экрана приветствия "© 1982 Sinclair Research Ltd".
+	current_tap_size = data_size; // Сохраняем размер для вашего хука на 0x0556
+	tap_current_pos = 0;
+	tap_is_loaded = true;
 
-    // Но так как ПЗУ Spectrum начнет сканировать ленту как только пользователь (или мы) вызовет LOAD "",
-    // наш Hook на адресе 0x0556 автоматически поймает этот вызов и мгновенно отдаст файлы из вектора current_tap_data!
+	// Полный аппаратный сброс всей системы
+	cpu.Reset();
 
-    return true;
+	// Замена std::fill на обычный цикл для очистки ОЗУ
+	for (size_t i = 0; i < 49152; ++i) {
+		spec_ram[i] = 0;
+	}
+
+	ay.Reset();
+
+	// Инициализируем клавиатурную матрицу по умолчанию
+	for (int i = 0; i < 8; i++) {
+		spec_key_rows[i] = 0x1F;
+		physical_key_rows[i] = 0x1F;
+		gui_key_rows[i] = 0x1F;
+	}
+
+	// Эмуляция автоматического ввода команды LOAD "" после старта ПЗУ.
+	// Наш Hook на адресе 0x0556 автоматически поймает этот вызов и мгновенно 
+	// отдаст файлы из сырого буфера current_tap_data вместо чтения с реальной ленты!
+
+	return true;
 }
 
 void UpdateRegisterDisplay() {
@@ -2015,91 +2058,149 @@ void UpdateRegisterDisplay() {
     SendMessageW(hRegListBox, LB_ADDSTRING, 0, (LPARAM)buf);
 }
 
-// Загрузка сырых дампов памяти или ленты игр Спектрума
 void LoadSpectrumFile(HWND hwnd) {
-    OPENFILENAMEW ofn = {};
-    wchar_t szFile[260] = { 0 };
+	OPENFILENAMEW ofn = {};
+	wchar_t szFile[260] = { 0 };
 
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = hwnd;
-    ofn.lpstrFile = szFile;
-    ofn.nMaxFile = sizeof(szFile) / sizeof(szFile[0]);
-    ofn.lpstrFilter =
-        L"Снимки и Ленты ZX Spectrum (*.sna;*.z80;*.tap)\0*.sna;*.z80;*.tap\0"
-        L"Дампы памяти (*.bin;*.rom)\0*.bin;*.rom\0"
-        L"Все файлы (*.*)\0*.*\0";
-    ofn.nFilterIndex = 1;
-    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+	ofn.lStructSize = sizeof(ofn);
+	ofn.hwndOwner = hwnd;
+	ofn.lpstrFile = szFile;
+	ofn.nMaxFile = sizeof(szFile) / sizeof(szFile[0]);
+	ofn.lpstrFilter =
+		L"Снимки и Ленты ZX Spectrum (*.sna;*.z80;*.tap)\0*.sna;*.z80;*.tap\0"
+		L"Дампы памяти (*.bin;*.rom)\0*.bin;*.rom\0"
+		L"Все файлы (*.*)\0*.*\0";
+	ofn.nFilterIndex = 1;
+	ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
 
-    if (GetOpenFileNameW(&ofn) != TRUE)
-        return;
+	if (GetOpenFileNameW(&ofn) != TRUE)
+		return;
 
-    std::ifstream file(ofn.lpstrFile, std::ios::binary);
-    if (!file.is_open()) {
-        MessageBoxW(hwnd, L"Не удалось открыть файл.",
-                    L"Ошибка", MB_OK | MB_ICONERROR);
-        return;
-    }
+	// --- Чтение файла через Win32 API ---
+	HANDLE hFile = CreateFileW(ofn.lpstrFile, GENERIC_READ, FILE_SHARE_READ,
+		NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (hFile == INVALID_HANDLE_VALUE) {
+		MessageBoxW(hwnd, L"Не удалось открыть файл.",
+			L"Ошибка", MB_OK | MB_ICONERROR);
+		return;
+	}
 
-    std::vector<BYTE> data(
-        (std::istreambuf_iterator<char>(file)),
-        std::istreambuf_iterator<char>());
-    file.close();
+	LARGE_INTEGER file_size;
+	if (!GetFileSizeEx(hFile, &file_size)) {
+		CloseHandle(hFile);
+		MessageBoxW(hwnd, L"Не удалось получить размер файла.",
+			L"Ошибка", MB_OK | MB_ICONERROR);
+		return;
+	}
 
-    // --- Очищаем звуковые буферы Windows ДО инжекции новой игры ---
-    // Это гарантирует, что звуки из прошлой игры мгновенно затихнут, 
-    // а новые порты инициализируются с чистого листа.
-    ClearAudioBuffers();
+	// Если файл аномально огромный для ZX Spectrum, ограничиваем его разумным пределом
+	size_t data_size = (size_t)file_size.QuadPart;
 
-    std::wstring path(szFile);
-    size_t dot = path.find_last_of(L'.');
-    std::wstring ext = (dot == std::wstring::npos) ? L"" : path.substr(dot);
-    for (wchar_t& c : ext)
-        c = (wchar_t)towlower(c);
+	// Выделяем память на куче Windows под размер файла
+	BYTE* data_ptr = (BYTE*)HeapAlloc(GetProcessHeap(), 0, data_size > 0 ? data_size : 1);
+	if (!data_ptr) {
+		CloseHandle(hFile);
+		MessageBoxW(hwnd, L"Недостаточно памяти для загрузки файла.",
+			L"Ошибка", MB_OK | MB_ICONERROR);
+		return;
+	}
 
-    std::wstring error;
-    bool ok = false;
+	DWORD bytes_read = 0;
+	if (!ReadFile(hFile, data_ptr, (DWORD)data_size, &bytes_read, NULL) || bytes_read != (DWORD)data_size) {
+		HeapFree(GetProcessHeap(), 0, data_ptr);
+		CloseHandle(hFile);
+		MessageBoxW(hwnd, L"Ошибка при чтении данных из файла.",
+			L"Ошибка", MB_OK | MB_ICONERROR);
+		return;
+	}
+	CloseHandle(hFile);
 
-    if (ext == L".sna")
-        ok = LoadSnaSnapshot(data, error);
-    else if (ext == L".z80")
-        ok = LoadZ80Snapshot(data, error);
-    else if (ext == L".tap")
-        ok = LoadTapFile(data, error);
-    else {
-        // Existing raw BIN/ROM behavior is kept for compatibility.
-        if (data.empty()) {
-            error = L"Файл пуст.";
-        } else {
-            size_t copy_size = (data.size() > 32768) ? 32768 : data.size();
-            std::fill(spec_ram, spec_ram + 49152, 0);
-            std::copy(data.begin(), data.begin() + copy_size,
-                      spec_ram + (0x5B00 - 0x4000));
-            cpu.Reset();
-            cpu.PC = 0x5B00;
-            cpu.SP = 0xFFFF;
-            ok = true;
-        }
-    }
+	// --- Очищаем звуковые буферы Windows ДО инжекции новой игры ---
+	ClearAudioBuffers();
 
-    if (!ok) {
-        MessageBoxW(hwnd, error.c_str(),
-                    L"Ошибка загрузки snapshot",
-                    MB_OK | MB_ICONERROR);
-        return;
-    }
+	// --- Поиск расширения файла вручную ---
+	const wchar_t* ext = L"";
+	size_t len = 0;
+	while (szFile[len] != L'\0') {
+		len++;
+	}
 
-    spec_flash_frame = 0;
-    spec_flash_state = false;
-    RebuildSpectrumKeyboardMatrix();
-    UpdateRegisterDisplay();
-    SetFocus(hwnd);
+	// Идем с конца строки, чтобы найти последнюю точку
+	for (size_t i = len; i > 0; --i) {
+		if (szFile[i - 1] == L'.') {
+			ext = &szFile[i - 1];
+			break;
+		}
+	}
 
-    wchar_t title[320];
-    swprintf_s(title, 320,
-               L"Эмулятор ZX Spectrum 48 (Z80 Core) — %s", szFile);
-    SetWindowTextW(hwnd, title);
+	// Приведение расширения к нижнему регистру (локальный буфер, чтобы не портить szFile)
+	wchar_t ext_lower[16] = { 0 };
+	for (size_t i = 0; i < 15 && ext[i] != L'\0'; ++i) {
+		ext_lower[i] = (wchar_t)towlower(ext[i]);
+	}
+
+	const wchar_t* error = nullptr; // Передаем по ссылке как const wchar_t*&
+	bool ok = false;
+
+	// Сравнение строк через wcscmp (стандартная библиотека C, не std::)
+	if (wcscmp(ext_lower, L".sna") == 0) {
+		// Убедитесь, что LoadSnaSnapshot также переведена на (const BYTE*, size_t, const wchar_t*&)
+		ok = LoadSnaSnapshot(data_ptr, data_size, error);
+	}
+	else if (wcscmp(ext_lower, L".z80") == 0) {
+		ok = LoadZ80Snapshot(data_ptr, data_size, error);
+	}
+	else if (wcscmp(ext_lower, L".tap") == 0) {
+		// Убедитесь, что LoadTapFile также переведена на (const BYTE*, size_t, const wchar_t*&)
+		ok = LoadTapFile(data_ptr, data_size, error);
+	}
+	else {
+		// Логика для сырых дампов .BIN / .ROM
+		if (data_size == 0) {
+			error = L"Файл пуст.";
+		}
+		else {
+			size_t copy_size = (data_size > 32768) ? 32768 : data_size;
+
+			// Замена std::fill
+			for (size_t i = 0; i < 49152; ++i) {
+				spec_ram[i] = 0;
+			}
+			// Замена std::copy
+			for (size_t i = 0; i < copy_size; ++i) {
+				spec_ram[(0x5B00 - 0x4000) + i] = data_ptr[i];
+			}
+
+			cpu.Reset();
+			cpu.PC = 0x5B00;
+			cpu.SP = 0xFFFF;
+			ok = true;
+		}
+	}
+
+	// Освобождаем выделенную память под файл
+	HeapFree(GetProcessHeap(), 0, data_ptr);
+
+	if (!ok) {
+		// error теперь содержит прямой указатель на строковый литерал из LoadZ80Snapshot
+		MessageBoxW(hwnd, error ? error : L"Неизвестная ошибка.",
+			L"Ошибка загрузки snapshot",
+			MB_OK | MB_ICONERROR);
+		return;
+	}
+
+	spec_flash_frame = 0;
+	spec_flash_state = false;
+	RebuildSpectrumKeyboardMatrix();
+	UpdateRegisterDisplay();
+	SetFocus(hwnd);
+
+	wchar_t title[320];
+	swprintf_s(title, 320,
+		L"Эмулятор ZX Spectrum 48 (Z80 Core) — %s", szFile);
+	SetWindowTextW(hwnd, title);
 }
+
 
 static void PollPhysicalKeyboard(HWND hwnd) {
     if (GetForegroundWindow() != hwnd) return;
