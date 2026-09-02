@@ -1,6 +1,7 @@
 ﻿#define UNICODE
 #define _UNICODE
 #include <windows.h>
+#include <stdint.h>
 #include <mmsystem.h>
 #include <fstream>
 
@@ -69,7 +70,7 @@ static const int AUDIO_EVENT_CAPACITY = 16384;
 static AudioEvent audio_events[AUDIO_EVENT_CAPACITY];
 static volatile LONG audio_event_write = 0;
 static volatile LONG audio_event_read = 0;
-constexpr double ZX_CPU_CLOCK_HZ = 3500000.0; // Z80 clock
+double ZX_CPU_CLOCK_HZ = 3500000.0; // Z80 clock
 
 static inline void QueueAudioEvent(BYTE type, BYTE reg, BYTE value) {
     LONG w = audio_event_write;
@@ -99,26 +100,43 @@ static inline bool PopAudioEvent(AudioEvent& ev) {
 // --- СТРУКТУРА МУЗЫКАЛЬНОГО СОПРОЦЕССОРА AY-3-8910 ---
 struct AY38910 {
     enum StereoMode { MODE_MONO, MODE_ABC, MODE_ACB };
-    StereoMode stereo_mode = MODE_ABC; // По умолчанию популярный в СНГ режим ABC
+    StereoMode stereo_mode;
 
-    BYTE regs[16] = {};                 // Физические регистры чипа
-    BYTE selected_reg = 0;              // Индекс выбранного регистра
+    BYTE regs[16];
+    BYTE selected_reg;
 
-    double tone_phase[3] = { 0.0, 0.0, 0.0 }; // Фазы генераторов тона (каналы A, B, C)
-    double noise_phase = 0.0;           // Фаза генератора шума
-    double envelope_phase = 0.0;        // Фаза генератора огибающей
+    double tone_phase[3];
+    double noise_phase;
+    double envelope_phase;
 
-    unsigned int noise_lfsr = 1;        // Регистр сдвига для генерации шума (LFSR)
-    int envelope_level = 0;             // Текущий уровень громкости огибающей
-    int envelope_direction = -1;        // Направление изменения огибающей (1 или -1)
-    bool envelope_hold = false;         // Флаг удержания уровня огибающей
-    bool envelope_started = false;      // Флаг активности цикла огибающей
+    unsigned int noise_lfsr;
+    int envelope_level;
+    int envelope_direction;
+    bool envelope_hold;
+    bool envelope_started;
+
+    // Конструктор для инициализации полей (совместим с VS2010)
+    AY38910() {
+        stereo_mode = MODE_ABC;
+        selected_reg = 0;
+        
+        // Обнуление массивов
+        memset(regs, 0, sizeof(regs));
+        tone_phase[0] = tone_phase[1] = tone_phase[2] = 0.0;
+        
+        noise_phase = 0.0;
+        envelope_phase = 0.0;
+        noise_lfsr = 1;
+        envelope_level = 0;
+        envelope_direction = -1;
+        envelope_hold = false;
+        envelope_started = false;
+    }
 
     // Таблица соответствия уровней громкости AY (логарифмическая шкала)
-    static constexpr double VOLUME[16] = {
-        0.000, 0.011, 0.016, 0.023, 0.032, 0.045, 0.064, 0.090,
-        0.126, 0.178, 0.250, 0.354, 0.500, 0.630, 0.794, 1.000
-    };
+    // static-массивы тоже нельзя инициализировать внутри класса в старых стандартах. 
+    // Для VS2010 определение VOLUME нужно вынести за пределы структуры!
+    static const double VOLUME[16];
 
     void Reset() {
         EnterCriticalSection(&audio_cs);
@@ -157,6 +175,12 @@ struct AY38910 {
     }
 } ay;
 
+// Определение статического массива VOLUME (вынесите в .cpp файл или ниже структуры)
+const double AY38910::VOLUME[16] = {
+    0.000, 0.011, 0.016, 0.023, 0.032, 0.045, 0.064, 0.090,
+    0.126, 0.178, 0.250, 0.354, 0.500, 0.630, 0.794, 1.000
+};
+
 DWORD WINAPI AudioThreadProc(LPVOID lpParam) {
     (void)lpParam;
 
@@ -176,8 +200,8 @@ DWORD WINAPI AudioThreadProc(LPVOID lpParam) {
 
     uint64_t render_tstate = audio_cpu_tstates;
 
-    AudioEvent ev{};
-    AudioEvent pending{};
+    AudioEvent ev;
+    AudioEvent pending;
     bool has_pending = false;
 
     while (audio_thread_running) {
@@ -419,14 +443,14 @@ struct CPUZ80 {
     WORD IX, IY;
     BYTE I, R;
     // IM0 support helper: byte placed on data bus by external device when IM=0
-    BYTE interrupt_vector_bus_byte = 0x00;
+    BYTE interrupt_vector_bus_byte;
 
     bool IFF1, IFF2; // Флаги разрешения прерываний Z80
     BYTE IM;         // Режим прерываний (0, 1 или 2)
     bool halted;
     bool int_pending;
-    int cycles_until_interrupt = 70000;
-    int ei_delay_counter = 0; // counter to implement EI one-instruction delay (2 -> will enable after next step)
+    int cycles_until_interrupt;
+    int ei_delay_counter; // counter to implement EI one-instruction delay (2 -> will enable after next step)
 
     void Reset() {
         PC = 0x0000;
@@ -441,6 +465,7 @@ struct CPUZ80 {
         int_pending = false;
         cycles_until_interrupt = 70000;
         ei_delay_counter = 0;
+		interrupt_vector_bus_byte = 0x00;
     }
 
     // Вспомогательные сеттеры/геттеры регистровых пар
@@ -2213,11 +2238,13 @@ static void PollPhysicalKeyboard(HWND hwnd) {
     };
 
     // 1. Опрос стандартных буквенно-цифровых клавиш
-    for (UINT vk : keys) {
-        int r, b;
-        if (MapVirtualKeyToSpectrum(vk, r, b))
-            SetPhysicalMatrixBit(r, b, (GetAsyncKeyState((int)vk) & 0x8000) != 0);
-    }
+	for (size_t i = 0; i < sizeof(keys); ++i) {
+		UINT vk = keys[i];
+		int r, b;
+		if (MapVirtualKeyToSpectrum(vk, r, b)) {
+			SetPhysicalMatrixBit(r, b, (GetAsyncKeyState((int)vk) & 0x8000) != 0);
+		}
+	}
 
     // 2. ОПРОС ФИЗИЧЕСКИХ СТРЕЛОК ПК КЛАВИАТУРЫ И КЛАВИШИ ВВОДА
     bool force_caps_shift = false;
@@ -2468,8 +2495,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
                         }
                     }
                     RebuildSpectrumKeyboardMatrix();
-                                        PollPhysicalKeyboard(hwnd);
-// Обновляем экран строго по прерыванию (50 кадров в секунду)
+                    PollPhysicalKeyboard(hwnd);
+					// Обновляем экран строго по прерыванию (50 кадров в секунду)
                     InvalidateRect(hwnd, NULL, FALSE);
                     UpdateRegisterDisplay();
 
