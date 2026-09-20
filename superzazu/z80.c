@@ -644,6 +644,39 @@ static inline uint16_t displace(
   return addr;
 }
 
+int z80_interrupt_now(z80* const z, uint8_t data)
+{
+    if (!z->iff1)
+        return 0;
+
+    z->int_pending = 0;
+    z->halted = 0;
+
+    z->iff1 = 0;
+    z->iff2 = 0;
+
+    inc_r(z);
+
+    switch (z->interrupt_mode) {
+    case 0:
+        z->cyc += 11;
+        exec_opcode(z, data);
+        return 11;
+
+    case 1:
+        z->cyc += 13;
+        call(z, 0x38);
+        return 13;
+
+    case 2:
+        z->cyc += 19;
+        call(z, rw(z, (z->i << 8) | data));
+        return 19;
+    }
+
+    return 0;
+}
+
 static inline void process_interrupts(z80* const z) {
   // "When an EI instruction is executed, any pending interrupt request
   // is not accepted until after the instruction following EI is executed."

@@ -13,6 +13,9 @@ typedef uint8_t  u8;
 typedef uint16_t u16;
 typedef int8_t   i8;
 
+#define Z80_CPU_SPEED           3500000   /* In Hz. */
+#define CYCLES_PER_STEP         (Z80_CPU_SPEED / 50)
+
 // Расширяем Си-структуру C++ методами. Бинарный лейаут в памяти не меняется!
 struct z80_cpp : public z80 {
     inline void init() { ::z80_init(this); }
@@ -20,6 +23,7 @@ struct z80_cpp : public z80 {
     inline void debug_output() { ::z80_debug_output(this); }
     inline void gen_nmi() { ::z80_gen_nmi(this); }
     inline void gen_int(uint8_t data) { ::z80_gen_int(this, data); }
+    inline int interrupt_now(uint8_t data) { return ::z80_interrupt_now(this, data); }
 };
 
 // Объявляем процессор с использованием C++ обертки
@@ -121,7 +125,6 @@ static const int AUDIO_EVENT_CAPACITY = 16384;
 static AudioEvent audio_events[AUDIO_EVENT_CAPACITY];
 static volatile LONG audio_event_write = 0;
 static volatile LONG audio_event_read = 0;
-constexpr double ZX_CPU_CLOCK_HZ = 3500000.0; // Z80 clock
 
 static inline void QueueAudioEvent(BYTE type, BYTE reg, BYTE value) {
     LONG w = audio_event_write;
@@ -213,7 +216,7 @@ DWORD WINAPI AudioThreadProc(LPVOID lpParam) {
     (void)lpParam;
 
     const double ay_clock = 1773400.0;
-    const double tstates_per_sample = (double)ZX_CPU_CLOCK_HZ / (double)audio_sample_rate;
+    const double tstates_per_sample = (double)Z80_CPU_SPEED / (double)audio_sample_rate;
 
     BYTE r[16] = {};
     BYTE beeper = 0;
@@ -593,7 +596,7 @@ bool HandleRomHook() {
 }
 
 // Глобальные переменные для менеджмента времени кадра, которые раньше были внутри StepZ80()
-int cycles_until_interrupt = 70000;
+int cycles_until_interrupt = CYCLES_PER_STEP;
 
 void Reset() {
     z80_init(&cpu);
@@ -601,7 +604,7 @@ void Reset() {
     cpu.write_byte = WriteByte;
     cpu.port_in = InPort;
     cpu.port_out = OutPort;
-    cycles_until_interrupt = 70000;
+    cycles_until_interrupt = CYCLES_PER_STEP;
 }
 
 // Обертка системного шага, заменяющая старый метод StepZ80
@@ -864,7 +867,7 @@ static bool LoadSnaSnapshot(const std::vector<BYTE>& data, std::wstring& error) 
 
     cpu.halted = false;
     cpu.int_pending = false;
-    cycles_until_interrupt = 70000;
+    cycles_until_interrupt = CYCLES_PER_STEP;
     return true;
 }
 
@@ -1041,7 +1044,7 @@ static bool LoadZ80Snapshot(const std::vector<BYTE>& data, std::wstring& error) 
 
     cpu.halted = false;
     cpu.int_pending = false;
-    cycles_until_interrupt = 70000;
+    cycles_until_interrupt = CYCLES_PER_STEP;
     return true;
 }
 
@@ -1411,34 +1414,29 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
 
         if (elapsed > 0.0) {
             last_time = current_time;
-            internal_debt += elapsed * ZX_CPU_CLOCK_HZ;
+            internal_debt += elapsed * Z80_CPU_SPEED;
 
             // Выполняем ровно столько тактов, сколько "задолжали" времени
             while (internal_debt > 0.0) {
-                int ticks = SystemStepZ80();
-                if (ticks <= 0) { // guard against faulty opcode handling returning 0 and locking the loop
-                    // Critical error inside CPU emulation; stop emulator to avoid infinite loop
-                    emulator_running = false;
-                    break;
-                }
-                internal_debt -= ticks;
-                audio_cpu_tstates += (uint64_t)ticks;
+                int ticks = 0;
 
-                // Декрементируем такты до прихода прерывания
-                cycles_until_interrupt -= ticks;
+                // Проверяем, наступил ли момент прерывания (50 Гц)
                 if (cycles_until_interrupt <= 0) {
-                    z80_gen_int(&cpu, 0xFF);
-                    cycles_until_interrupt += 70000; // 50 Гц прерывания
+                    cycles_until_interrupt += CYCLES_PER_STEP;
 
-                    // ZX Spectrum FLASH changes phase every 16 video frames.
-                    // At 50 Hz this gives ~320 ms ON and ~320 ms OFF.
+                    // Инициируем аппаратное INT-прерывание для z80
+                    int int_ticks = z80_interrupt_now(&cpu, 0xFF);
+
+                    if (int_ticks > 0)
+                        ticks = int_ticks;
+
+                    // Обновление состояния FLASH
                     if (++spec_flash_frame >= 16) {
                         spec_flash_frame = 0;
                         spec_flash_state = !spec_flash_state;
                     }
 
-                    // Release virtual GUI keys independently, without touching
-                    // physical keys that may still be held down.
+                    // Обновление виртуальных клавиш GUI
                     for (int k = 0; k < 40; ++k) {
                         if (gui_key_frames[k] > 0) {
                             --gui_key_frames[k];
@@ -1450,12 +1448,20 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
                         }
                     }
                     RebuildSpectrumKeyboardMatrix();
-                                        PollPhysicalKeyboard(hwnd);
-// Обновляем экран строго по прерыванию (50 кадров в секунду)
+                    PollPhysicalKeyboard(hwnd);
+
+                    // Перерисовка экрана Windows строго по прерыванию кадра
                     InvalidateRect(hwnd, NULL, FALSE);
                     UpdateRegisterDisplay();
-
                 }
+                else {
+                    // Обычный пошаговый вызов эмуляции одной инструкции
+                    ticks = SystemStepZ80();
+                }
+
+                internal_debt -= ticks;
+                audio_cpu_tstates += (uint64_t)ticks;
+                cycles_until_interrupt -= ticks;
             }
         }
         else {

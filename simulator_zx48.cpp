@@ -10,6 +10,9 @@
 // --- ПАРАМЕТРЫ ЭКРАНА ZX SPECTRUM ---
 #define IDM_FILE_OPEN 0x0010
 
+#define Z80_CPU_SPEED           3500000   /* In Hz. */
+#define CYCLES_PER_STEP         (Z80_CPU_SPEED / 50)
+
 // --- ГЛОБАЛЬНАЯ ПАМЯТЬ ---
 BYTE spec_rom[16384]; // 16 Кб ПЗУ (0x0000 - 0x3FFF)
 BYTE spec_ram[49156]; // 48 Кб ОЗУ + безопасный запас для адреса 0xFFFF
@@ -70,7 +73,6 @@ static const int AUDIO_EVENT_CAPACITY = 16384;
 static AudioEvent audio_events[AUDIO_EVENT_CAPACITY];
 static volatile LONG audio_event_write = 0;
 static volatile LONG audio_event_read = 0;
-double ZX_CPU_CLOCK_HZ = 3500000.0; // Z80 clock
 
 static inline void QueueAudioEvent(BYTE type, BYTE reg, BYTE value) {
     LONG w = audio_event_write;
@@ -185,7 +187,7 @@ DWORD WINAPI AudioThreadProc(LPVOID lpParam) {
     (void)lpParam;
 
     const double ay_clock = 1773400.0;
-    const double tstates_per_sample = (double)ZX_CPU_CLOCK_HZ / (double)audio_sample_rate;
+    const double tstates_per_sample = (double)Z80_CPU_SPEED / (double)audio_sample_rate;
 
     BYTE r[16] = {};
     BYTE beeper = 0;
@@ -463,7 +465,7 @@ struct CPUZ80 {
         IM = 1;
         halted = false;
         int_pending = false;
-        cycles_until_interrupt = 70000;
+        cycles_until_interrupt = CYCLES_PER_STEP;
         ei_delay_counter = 0;
 		interrupt_vector_bus_byte = 0x00;
     }
@@ -560,6 +562,57 @@ struct CPUZ80 {
 
     }
 
+    int InterruptNow(BYTE data)
+    {
+        if (!IFF1)
+            return 0;
+
+        // Interrupt acknowledge:
+        // IFF1/IFF2 сбрасываются до входа в ISR.
+        IFF1 = false;
+        IFF2 = false;
+        halted = false;
+
+        // Z80 increments R on interrupt acknowledge.
+        R = (R & 0x80) | ((R + 1) & 0x7F);
+
+        // Push current PC, exactly like CALL/RST.
+        WriteByte(--SP, (BYTE)(PC >> 8));
+        WriteByte(--SP, (BYTE)(PC & 0xFF));
+
+        switch (IM) {
+        case 0:
+            // For this Spectrum emulator the external device supplies FF,
+            // i.e. RST 38h.
+            if (data == 0xFF) {
+                PC = 0x0038;
+                return 13;
+            }
+
+            // More general IM0 handling can be added later.
+            PC = 0x0038;
+            return 13;
+
+        case 1:
+            PC = 0x0038;
+            return 13;
+
+        case 2:
+        {
+            WORD vector_addr = (WORD)(((WORD)I << 8) | data);
+
+            WORD target_pc =
+                (WORD)ReadByte(vector_addr) |
+                (WORD)(ReadByte((WORD)(vector_addr + 1)) << 8);
+
+            PC = target_pc;
+            return 19;
+        }
+        }
+
+        return 0;
+    }
+
     int StepZ80() {
         // Epilog helper: runs on function exit to handle EI delayed enable
         if (ei_delay_counter > 0) {
@@ -567,48 +620,6 @@ struct CPUZ80 {
             if (ei_delay_counter == 0) {
                 IFF1 = true; // enable interrupts after one instruction following EI
                 IFF2 = true;
-            }
-        }
-
-        // 1. Проверка маскируемого прерывания (50 Гц)
-        if (int_pending && IFF1) {
-            int_pending = false;
-            halted = false;
-            // Save previous IFF1 in IFF2 so RETN/RETI can restore it, then disable maskable interrupts
-            IFF2 = IFF1;
-            IFF1 = false;
-
-            // Сохраняем текущий адрес возврата в стек
-            WriteByte(--SP, PC >> 8);
-            WriteByte(--SP, PC & 0xFF);
-
-            // Обработка согласно режимам прерываний Z80
-            if (IM == 1) {
-                PC = 0x0038; // Стандартная обработка ZX Spectrum 48K
-                return 13; // IM1: 13 T-states
-            }
-            else if (IM == 0) {
-                // IM0: if an external device supplied a vector byte on the data bus,
-                // the CPU will execute that opcode directly. We emulate a pragmatic
-                // behavior: if interrupt_vector_bus_byte is non-zero and corresponds
-                // to a RST n (0xC7/0xCF/.../0xFF) we jump to its vector; otherwise
-                // fallback to IM1 (0x0038).
-                if (interrupt_vector_bus_byte >= 0xC7 && interrupt_vector_bus_byte <= 0xFF) {
-                    // RST n - compute vector
-                    BYTE rst_index = (interrupt_vector_bus_byte - 0xC7) / 8;
-                    WORD target = (WORD)(rst_index * 8);
-                    PC = target;
-                    return 13; // treat like RST timing
-                }
-                OutputDebugStringA("IM0: no vector byte or unsupported; treating as IM1 (0x0038)\n");
-                PC = 0x0038;
-                return 13;
-            }
-            else if (IM == 2) {
-                WORD vector_addr = (I << 8) | 0xFF;
-                WORD target_pc = ReadByte(vector_addr) | (ReadByte((WORD)(vector_addr + 1)) << 8);
-                PC = target_pc;
-                return 19; // IM2: 19 T-states (vector fetch + indirect)
             }
         }
 
@@ -1807,7 +1818,7 @@ static bool LoadSnaSnapshot(const BYTE* data, size_t data_size, const wchar_t*& 
 	cpu.halted = false;
 	cpu.int_pending = false;
 	cpu.ei_delay_counter = 0;
-	cpu.cycles_until_interrupt = 70000;
+	cpu.cycles_until_interrupt = CYCLES_PER_STEP;
 	return true;
 }
 
@@ -2010,7 +2021,7 @@ static bool LoadZ80Snapshot(const BYTE* data, size_t data_size, const wchar_t*& 
 	cpu.halted = false;
 	cpu.int_pending = false;
 	cpu.ei_delay_counter = 0;
-	cpu.cycles_until_interrupt = 70000;
+	cpu.cycles_until_interrupt = CYCLES_PER_STEP;
 	return true;
 }
 
@@ -2456,34 +2467,29 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
 
         if (elapsed > 0.0) {
             last_time = current_time;
-            internal_debt += elapsed * ZX_CPU_CLOCK_HZ;
+            internal_debt += elapsed * Z80_CPU_SPEED;
 
             // Выполняем ровно столько тактов, сколько "задолжали" времени
             while (internal_debt > 0.0) {
-                int ticks = cpu.StepZ80();
-                if (ticks <= 0) { // guard against faulty opcode handling returning 0 and locking the loop
-                    // Critical error inside CPU emulation; stop emulator to avoid infinite loop
-                    emulator_running = false;
-                    break;
-                }
-                internal_debt -= ticks;
-                audio_cpu_tstates += (uint64_t)ticks;
+                int ticks = 0;
 
-                // Декрементируем такты до прихода прерывания
-                cpu.cycles_until_interrupt -= ticks;
+                // Проверяем, наступил ли момент прерывания (50 Гц)
                 if (cpu.cycles_until_interrupt <= 0) {
-                    cpu.int_pending = true;
-                    cpu.cycles_until_interrupt += 70000; // 50 Гц прерывания
+                    cpu.cycles_until_interrupt += CYCLES_PER_STEP;
 
-                    // ZX Spectrum FLASH changes phase every 16 video frames.
-                    // At 50 Hz this gives ~320 ms ON and ~320 ms OFF.
+                    // Инициируем аппаратное INT-прерывание для z80
+                    int int_ticks = cpu.InterruptNow(0xFF);
+
+                    if (int_ticks > 0)
+                        ticks = int_ticks;
+
+                    // Обновление состояния FLASH
                     if (++spec_flash_frame >= 16) {
                         spec_flash_frame = 0;
                         spec_flash_state = !spec_flash_state;
                     }
 
-                    // Release virtual GUI keys independently, without touching
-                    // physical keys that may still be held down.
+                    // Обновление виртуальных клавиш GUI
                     for (int k = 0; k < 40; ++k) {
                         if (gui_key_frames[k] > 0) {
                             --gui_key_frames[k];
@@ -2496,11 +2502,19 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
                     }
                     RebuildSpectrumKeyboardMatrix();
                     PollPhysicalKeyboard(hwnd);
-					// Обновляем экран строго по прерыванию (50 кадров в секунду)
+
+                    // Перерисовка экрана Windows строго по прерыванию кадра
                     InvalidateRect(hwnd, NULL, FALSE);
                     UpdateRegisterDisplay();
-
                 }
+                else {
+                    // Обычный пошаговый вызов эмуляции одной инструкции
+                    ticks = cpu.StepZ80();
+                }
+
+                internal_debt -= ticks;
+                audio_cpu_tstates += (uint64_t)ticks;
+                cpu.cycles_until_interrupt -= ticks;
             }
         }
         else {

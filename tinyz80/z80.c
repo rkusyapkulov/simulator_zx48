@@ -55,6 +55,7 @@ void init(void);
 int step(void);
 void gen_nmi(void);
 void gen_int(u8 data);
+int z80_interrupt_now(u8 data);
 
 // ---------------------------------------
 // BIT FLAG BITMASK HELPERS (F REGISTER)
@@ -390,6 +391,32 @@ static const u16 ed_cycles[256] = {
     [0xA2]=16, [0xAA]=16, [0xA3]=16, [0xAB]=16,
     [0xB2]=16, [0xBA]=16, [0xB3]=16, [0xBB]=16,
 };
+
+int z80_interrupt_now(u8 data)
+{
+    if (!cpu.IFF1)
+        return 0;
+
+    cpu.IFF1 = cpu.IFF2 = 0;
+    cpu.halted = 0;
+
+    inc_r();
+
+    switch (cpu.IM) {
+    case 0:
+        return exec(data) + 2;
+
+    case 1:
+        call(0x38);
+        return 13;
+
+    case 2:
+        call(r16((cpu.I << 8) | data));
+        return 19;
+    }
+
+    return 0;
+}
 
 int step(void) {
     int cycles = 0;
