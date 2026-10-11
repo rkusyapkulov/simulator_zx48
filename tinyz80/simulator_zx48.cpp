@@ -76,7 +76,13 @@ BYTE physical_key_rows[8] = { 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F }; 
 BYTE gui_key_rows[8] = { 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F }; // virtual keyboard state
 int gui_key_frames[40] = {};            // virtual key pulse duration in 50 Hz frames
 bool emulator_running = true;
-static DWORD pixel_buffer[256 * 192];
+
+#define BORDER_WIDTH  32
+#define BORDER_HEIGHT 32
+#define SCREEN_WIDTH  (256 + BORDER_WIDTH * 2)  // 320
+#define SCREEN_HEIGHT (192 + BORDER_HEIGHT * 2) // 256
+
+static DWORD pixel_buffer[SCREEN_WIDTH * SCREEN_HEIGHT];
 
 // --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ ЭМУЛЯЦИИ ЛЕНТЫ ---
 std::vector<BYTE> current_tap_data; // Буфер текущего TAP-файла
@@ -611,7 +617,7 @@ int SystemStepZ80()
     return cpu.step();
 }
 
-// --- ПОПИКСЕЛЬНЫЙ РЕНДЕРИНГ ЭКРАНА ZX SPECTRUM ---
+// --- ПОПИКСЕЛЬНЫЙ РЕНДЕРИНГ ЭКРАНА ZX SPECTRUM С БОРДЮРОМ ---
 void RenderSpectrumScreen(HDC hdc, int xOffset, int yOffset) {
     // ЕДИНЫЙ и 100% правильный массив палитры в формате RGB (под ваш StretchDIBits)
     static const DWORD spec_palette[16] = {
@@ -635,14 +641,16 @@ void RenderSpectrumScreen(HDC hdc, int xOffset, int yOffset) {
         0x00FFFFFF  // 15: Чистый белый
     };
 
-    // ВАЖНО: Если вам нужен полноценный бордюр ВОКРУГ экрана, размер pixel_buffer и bmiHeader
-    // должен быть увеличен (например, до 320x240). 
-    // Поскольку ваш pixel_buffer имеет фиксированный размер 256x192, мы просто заполняем его 
-    // цветом бордюра, если активная память экрана пуста, либо сразу пишем туда пиксели.
+    // Получаем текущий цвет бордюра
     int border_color_idx = spec_border_color & 0x07;
     DWORD border_color = spec_palette[border_color_idx];
 
-    // Рендеринг активного экрана 256x192 (Один чистый проход)
+    // Этап 1: Быстрая заливка всего увеличенного буфера (включая бордюр) цветом бордюра
+    for (int i = 0; i < SCREEN_WIDTH * SCREEN_HEIGHT; i++) {
+        pixel_buffer[i] = border_color;
+    }
+
+    // Этап 2: Рендеринг активного экрана 256x192 со смещением в центр
     for (int y = 0; y < 192; y++) {
         // Вычисление интерлейсного адреса растровой строки ZX Spectrum
         int zone = (y >> 6) & 3;       // 3 зоны по 64 строки
@@ -650,7 +658,8 @@ void RenderSpectrumScreen(HDC hdc, int xOffset, int yOffset) {
         int char_row = (y >> 3) & 7;    // строка символов в зоне
         WORD pixel_line_addr = 0x4000 + (zone << 11) + (line << 8) + (char_row << 5);
 
-        int target_y = (192 - 1) - y;  // Инвертируем Y для StretchDIBits (снизу вверх)
+        // Инвертируем Y для StretchDIBits (снизу вверх) с учетом верхнего бордюра
+        int target_y = (SCREEN_HEIGHT - 1) - (y + BORDER_HEIGHT);
 
         for (int x_byte = 0; x_byte < 32; x_byte++) {
             BYTE pixel_data = spec_ram[pixel_line_addr - 0x4000 + x_byte];
@@ -675,24 +684,26 @@ void RenderSpectrumScreen(HDC hdc, int xOffset, int yOffset) {
 
             for (int bit = 0; bit < 8; bit++) {
                 bool pixel_active = (pixel_data & (1 << (7 - bit))) != 0;
-                int pixel_x = (x_byte * 8) + bit;
+
+                // Вычисляем X координату в буфере с учетом левого бордюра
+                int pixel_x = BORDER_WIDTH + (x_byte * 8) + bit;
 
                 // Записываем финальный цвет пикселя в буфер кадра
-                pixel_buffer[target_y * 256 + pixel_x] = pixel_active ? ink_color : paper_color;
+                pixel_buffer[target_y * SCREEN_WIDTH + pixel_x] = pixel_active ? ink_color : paper_color;
             }
         }
     }
 
     BITMAPINFO bmi = { 0 };
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = 256;
-    bmi.bmiHeader.biHeight = 192;
+    bmi.bmiHeader.biWidth = SCREEN_WIDTH;
+    bmi.bmiHeader.biHeight = SCREEN_HEIGHT;
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
 
-    // Выводим отрендеренный кадр с масштабированием х2 в окно Windows
-    StretchDIBits(hdc, xOffset, yOffset, 256 * 2, 192 * 2, 0, 0, 256, 192, pixel_buffer, &bmi, DIB_RGB_COLORS, SRCCOPY);
+    // Выводим отрендеренный кадр (основной экран + бордюр) с масштабированием х2 в окно Windows
+    StretchDIBits(hdc, xOffset, yOffset, SCREEN_WIDTH * 2, SCREEN_HEIGHT * 2, 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, pixel_buffer, &bmi, DIB_RGB_COLORS, SRCCOPY);
 }
 
 
@@ -703,7 +714,7 @@ void RenderSpectrumScreen(HDC hdc, int xOffset, int yOffset) {
 // --- СОЗДАНИЕ ИНТЕРФЕЙСА ВИРТУАЛЬНОЙ КЛАВИАТУРЫ ---
 void CreateSpectrumKeyboardUI(HWND hwndParent, HINSTANCE hInst) {
     const int BTN_W = 52; const int BTN_H = 42;
-    const int START_X = 20; const int START_Y = 440; const int GAP = 5;
+    const int START_X = 20; const int START_Y = 550; const int GAP = 5;
 
     // Матрица подписей для 40 оригинальных клавиш ZX Spectrum
     static const wchar_t* spec_labels[] = {
@@ -1228,7 +1239,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             AppendMenuW(hSysMenu, MF_STRING, IDM_FILE_OPEN, L"Открыть файл Спектрума...");
         }
         CreateSpectrumKeyboardUI(hwnd, hInst);
-        int PANEL_X = 600;
+        int PANEL_X = 680;
         CreateWindowExW(0, L"BUTTON", L"СБРОС (RESET)", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, PANEL_X, 20, 180, 40, hwnd, (HMENU)2000, hInst, NULL);
         hRegListBox = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", NULL, WS_CHILD | WS_VISIBLE | WS_VSCROLL, PANEL_X, 75, 180, 220, hwnd, (HMENU)2001, NULL, NULL);
 
@@ -1315,7 +1326,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     // Подготовка размеров под экран Spectrum (256x192 в масштабе x2) и панель отладки
     HWND hwnd = CreateWindowExW(0, L"ZX_Spectrum_48_Core", L"Эмулятор ZX Spectrum 48 (Z80 Core)",
         WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 820, 680, NULL, NULL, hInst, NULL);
+        CW_USEDEFAULT, CW_USEDEFAULT, 950, 790, NULL, NULL, hInst, NULL);
 
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
