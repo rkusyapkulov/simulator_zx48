@@ -79,6 +79,7 @@ static const int AUDIO_EVENT_CAPACITY = 16384;
 static AudioEvent audio_events[AUDIO_EVENT_CAPACITY];
 static volatile LONG audio_event_write = 0;
 static volatile LONG audio_event_read = 0;
+static volatile LONG audio_clear_request = 0;
 
 static inline void QueueAudioEvent(BYTE type, BYTE reg, BYTE value) {
     LONG w = audio_event_write;
@@ -214,6 +215,22 @@ DWORD WINAPI AudioThreadProc(LPVOID lpParam) {
 
     while (audio_thread_running) {
         bool didWork = false;
+
+        if (InterlockedExchange(&audio_clear_request, 0)) {
+            waveOutReset(hWaveOut);                // буферы вернутся с WHDR_DONE и будут заполнены заново
+            audio_event_read = audio_event_write;
+            has_pending = false;
+            ZeroMemory(r, sizeof(r));
+            beeper = 0;
+            tone_phase[0] = tone_phase[1] = tone_phase[2] = 0.0;
+            noise_phase = 0.0;  noise_lfsr = 1;
+            envelope_phase = 0.0;  envelope_level = 0;  envelope_direction = -1;
+            envelope_hold = true;  envelope_started = false;
+            for (int k = 0; k < 2; ++k)
+                if (audioBuffers[k]) ZeroMemory(audioBuffers[k], AUDIO_BUF_SIZE * 2 * sizeof(short));
+            render_tstate = audio_cpu_tstates;
+            continue;
+        }
 
         for (int i = 0; i < 2; ++i) {
             if (!(waveHeader[i].dwFlags & WHDR_DONE))
@@ -394,7 +411,7 @@ void StopAudio() {
         CloseHandle(audio_thread);
         audio_thread = NULL;
     }
-    // drain and unprepare headers and free buffers
+    if (hWaveOut) waveOutReset(hWaveOut);   // вернуть буферы ДО Unprepare и free
     for (int i = 0; i < 2; i++) {
         if (waveHeader[i].lpData) {
             waveOutUnprepareHeader(hWaveOut, &waveHeader[i], sizeof(WAVEHDR));
@@ -415,25 +432,7 @@ void StopAudio() {
 
 void ClearAudioBuffers() {
     if (!audio_initialized || !hWaveOut) return;
-
-    // 1. Мгновенно останавливаем аудиокарту и возвращаем буферы Windows
-    waveOutReset(hWaveOut);
-
-    // 2. Сбрасываем атомарные указатели кольцевого буфера звуковых событий
-    audio_event_read = 0;
-    audio_event_write = 0;
-
-    // 3. Заполняем физические буферы тишиной и отправляем обратно в очередь
-    for (int i = 0; i < 2; i++) {
-        if (audioBuffers[i]) {
-            ZeroMemory(audioBuffers[i], AUDIO_BUF_SIZE * 2 * sizeof(short));
-            waveHeader[i].dwFlags = 0;
-            waveHeader[i].dwBufferLength = AUDIO_BUF_SIZE * 2 * sizeof(short);
-
-            waveOutPrepareHeader(hWaveOut, &waveHeader[i], sizeof(WAVEHDR));
-            waveOutWrite(hWaveOut, &waveHeader[i], sizeof(WAVEHDR));
-        }
-    }
+    InterlockedExchange(&audio_clear_request, 1);
 }
 
 // --- СТРУКТУРА ПРОЦЕССОРА Z80 ---
@@ -520,27 +519,15 @@ struct CPUZ80 {
                     result &= spec_key_rows[i];
                 }
             }
-            return result | 0xC0 | (spec_ear_signal ? 0x20 : 0x00); // ULA: bits 7/6 high, bit 5 = EAR
+            return result | 0xA0 | (spec_ear_signal ? 0x40 : 0x00);   // биты 7 и 5 = 1, бит 6 = EAR
         }
-        // Floating bus behaviour: return the last value driven by ULA when
-        // reading from unspecified ports.
-        // Basic EAR/MIC stub: if high byte indicates tape port (rare), return
-        // a simple representation of ear signal (0x00 for low, 0xFF for high)
-        // otherwise return last floating bus value.
-        // Example: if hardware used port 0xFEFE/0xFDFE variants for tape, check upper byte
-        BYTE high = (BYTE)((port >> 8) & 0xFF);
-        if (high == 0xFF) {
-            return spec_ear_signal ? 0xFF : 0x00;
-        }
-        if (port == 0xFFFD) return ay.selected_reg;
-        if (port == 0xBFFD) {
-            EnterCriticalSection(&audio_cs);
-            BYTE v = ay.ReadRegister(ay.selected_reg);
-            LeaveCriticalSection(&audio_cs);
-            return v;
-        }
-
-        return spec_last_floating_bus;
+	    if (port == 0xFFFD) {   // чтение выбранного регистра AY (0xBFFD только для записи)
+	        EnterCriticalSection(&audio_cs);
+	        BYTE v = ay.ReadRegister(ay.selected_reg);
+	        LeaveCriticalSection(&audio_cs);
+	        return v;
+	    }
+	    return 0xFF;            // свободные порты, в т.ч. Kempston 0x1F: без фантомных нажатий
     }
 
     inline void OutPort(WORD port, BYTE val) {
@@ -2365,6 +2352,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 // --- WINMAIN С ПОДДЕРЖКОЙ СИНХРОНИЗАЦИИ ---
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
+    InitializeCriticalSection(&audio_cs);
+    audio_cs_initialized = true;
+    ay.Reset();
+
     // Подготовка чистого дампа ПЗУ 48К (базовая инициализация по умолчанию)
     memset(spec_rom, 0x00, 16384);
 
@@ -2379,6 +2370,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
         spec_rom[0] = 0xF3; // DI
         spec_rom[1] = 0x31; spec_rom[2] = 0xFF; spec_rom[3] = 0xFF; // LD SP, 0xFFFF
         spec_rom[4] = 0x18; spec_rom[5] = 0xFE; // JR $ (зацикливание)
+        MessageBoxW(NULL, L"Файл ZXSpectrum48.rom не найден в текущей папке.\nЭмулятор запустится с заглушкой вместо ПЗУ.",
+            L"ПЗУ не найдено", MB_OK | MB_ICONWARNING);
     }
 
     WNDCLASSW wc = { 0 };
@@ -2428,10 +2421,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     double internal_debt = 0.0;
     QueryPerformanceFrequency(&frequency);
     QueryPerformanceCounter(&last_time);
-
-    InitializeCriticalSection(&audio_cs);
-    audio_cs_initialized = true;
-    ay.Reset();
 
     while (emulator_running) {
         MsgWaitForMultipleObjectsEx(0, NULL, 1, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
