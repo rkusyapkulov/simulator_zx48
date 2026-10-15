@@ -85,10 +85,7 @@ static inline void QueueAudioEvent(BYTE type, BYTE reg, BYTE value) {
     LONG w = audio_event_write;
     LONG r = audio_event_read;
     LONG next = (w + 1) % AUDIO_EVENT_CAPACITY;
-    if (next == r) {
-        // Drop the oldest event rather than blocking the Z80.
-        audio_event_read = (r + 1) % AUDIO_EVENT_CAPACITY;
-    }
+    if (next == r) return;   // очередь полна: теряем новое событие (индекс чтения принадлежит аудиопотоку)
     audio_events[w].tstate = audio_cpu_tstates;
     audio_events[w].type = type;
     audio_events[w].reg = reg;
@@ -217,8 +214,6 @@ DWORD WINAPI AudioThreadProc(LPVOID lpParam) {
         bool didWork = false;
 
         if (InterlockedExchange(&audio_clear_request, 0)) {
-            waveOutReset(hWaveOut);                // буферы вернутся с WHDR_DONE и будут заполнены заново
-            audio_event_read = audio_event_write;
             has_pending = false;
             ZeroMemory(r, sizeof(r));
             beeper = 0;
@@ -226,8 +221,6 @@ DWORD WINAPI AudioThreadProc(LPVOID lpParam) {
             noise_phase = 0.0;  noise_lfsr = 1;
             envelope_phase = 0.0;  envelope_level = 0;  envelope_direction = -1;
             envelope_hold = true;  envelope_started = false;
-            for (int k = 0; k < 2; ++k)
-                if (audioBuffers[k]) ZeroMemory(audioBuffers[k], AUDIO_BUF_SIZE * 2 * sizeof(short));
             render_tstate = audio_cpu_tstates;
             continue;
         }
@@ -282,7 +275,7 @@ DWORD WINAPI AudioThreadProc(LPVOID lpParam) {
 
                 // 1. Генерация Шума
                 int np = r[6] & 0x1F;
-                if (np == 0) np = 32;
+                if (np == 0) np = 1;
                 noise_phase += ay_clock / (16.0 * np * audio_sample_rate);
                 while (noise_phase >= 1.0) {
                     noise_phase -= 1.0;
@@ -294,8 +287,8 @@ DWORD WINAPI AudioThreadProc(LPVOID lpParam) {
 
                 // 2. Генерация Огибающей
                 int ep = r[11] | ((int)r[12] << 8);
-                if (ep == 0) ep = 65536;
-                envelope_phase += ay_clock / (256.0 * ep * audio_sample_rate);
+                if (ep == 0) ep = 1;
+                envelope_phase += ay_clock / (16.0 * ep * audio_sample_rate);
                 while (envelope_phase >= 1.0) {
                     envelope_phase -= 1.0;
                     if (!envelope_hold) {
@@ -303,19 +296,13 @@ DWORD WINAPI AudioThreadProc(LPVOID lpParam) {
                         if (envelope_level < 0 || envelope_level > 15) {
                             BYTE shape = r[13] & 0x0F;
                             bool cont = (shape & 0x08) != 0;
+                            bool attack = (shape & 0x04) != 0;
                             bool alt = (shape & 0x02) != 0;
                             bool hold = (shape & 0x01) != 0;
-                            if (!cont || hold) {
-                                envelope_level = envelope_direction > 0 ? 15 : 0;
-                                envelope_hold = true;
-                            }
-                            else if (alt) {
-                                envelope_direction = -envelope_direction;
-                                envelope_level = envelope_direction > 0 ? 0 : 15;
-                            }
-                            else {
-                                envelope_level = envelope_direction > 0 ? 0 : 15;
-                            }
+                            if (!cont) { envelope_level = 0; envelope_hold = true; }                 // формы 0..7
+                            else if (hold) { envelope_level = (attack != alt) ? 15 : 0; envelope_hold = true; } // 9, 11, 13, 15
+                            else if (alt) { envelope_direction = -envelope_direction; envelope_level = envelope_direction > 0 ? 0 : 15; }
+                            else { envelope_level = envelope_direction > 0 ? 0 : 15; }
                         }
                     }
                 }
@@ -324,11 +311,12 @@ DWORD WINAPI AudioThreadProc(LPVOID lpParam) {
                 double ch_amp[3] = { 0.0, 0.0, 0.0 };
                 for (int ch = 0; ch < 3; ++ch) {
                     int tp = r[ch * 2] | ((r[ch * 2 + 1] & 0x0F) << 8);
-                    if (tp == 0) tp = 4096;
+                    if (tp == 0) tp = 1;
                     tone_phase[ch] += ay_clock / (16.0 * tp * audio_sample_rate);
                     tone_phase[ch] -= floor(tone_phase[ch]);
 
                     double tone = tone_phase[ch] < 0.5 ? 1.0 : -1.0;
+                    if (tp < 6) tone = 1.0;   // выше частоты Найквиста: постоянный уровень вместо алиасинга
                     BYTE mixer = r[7];
                     bool tone_on = (mixer & (1 << ch)) == 0;
                     bool noise_on = (mixer & (1 << (ch + 3))) == 0;
@@ -337,6 +325,7 @@ DWORD WINAPI AudioThreadProc(LPVOID lpParam) {
                     if (tone_on && noise_on) sig = tone * noise;
                     else if (tone_on) sig = tone;
                     else if (noise_on) sig = noise;
+                    else sig = 1.0;           // тон и шум выключены: постоянная 1
 
                     BYTE vr = r[8 + ch];
                     double amp = (vr & 0x10)
@@ -432,6 +421,25 @@ void StopAudio() {
 
 void ClearAudioBuffers() {
     if (!audio_initialized || !hWaveOut) return;
+
+    // 1. Мгновенно останавливаем аудиокарту и возвращаем буферы Windows
+    waveOutReset(hWaveOut);
+
+    // 2. Сбрасываем атомарные указатели кольцевого буфера звуковых событий
+    audio_event_read = 0;
+    audio_event_write = 0;
+
+    // 3. Заполняем физические буферы тишиной и отправляем обратно в очередь
+    for (int i = 0; i < 2; i++) {
+        if (audioBuffers[i]) {
+            ZeroMemory(audioBuffers[i], AUDIO_BUF_SIZE * 2 * sizeof(short));
+            waveHeader[i].dwFlags = 0;
+            waveHeader[i].dwBufferLength = AUDIO_BUF_SIZE * 2 * sizeof(short);
+
+            waveOutPrepareHeader(hWaveOut, &waveHeader[i], sizeof(WAVEHDR));
+            waveOutWrite(hWaveOut, &waveHeader[i], sizeof(WAVEHDR));
+        }
+    }
     InterlockedExchange(&audio_clear_request, 1);
 }
 
@@ -545,6 +553,7 @@ struct CPUZ80 {
             return;
         }
 
+        // 3. Стандартный системный порт ULA (0xFE)
         if ((port & 0xFF) == 0xFE) {
             // Bit 4 controls the beeper (speaker)
             spec_speaker_state = (val & 0x10) != 0;
@@ -552,7 +561,6 @@ struct CPUZ80 {
             // Bits 0..2 set the border color on a real Spectrum
             spec_border_color = val & 0x07;
         }
-
     }
 
     int InterruptNow(BYTE data)
@@ -613,6 +621,48 @@ struct CPUZ80 {
             if (ei_delay_counter == 0) {
                 IFF1 = true; // enable interrupts after one instruction following EI
                 IFF2 = true;
+            }
+        }
+
+        // 1. Проверка маскируемого прерывания (50 Гц)
+        if (int_pending && IFF1) {
+            int_pending = false;
+            halted = false;
+            // Save previous IFF1 in IFF2 so RETN/RETI can restore it, then disable maskable interrupts
+            IFF2 = IFF1;
+            IFF1 = false;
+
+            // Сохраняем текущий адрес возврата в стек
+            WriteByte(--SP, PC >> 8);
+            WriteByte(--SP, PC & 0xFF);
+
+            // Обработка согласно режимам прерываний Z80
+            if (IM == 1) {
+                PC = 0x0038; // Стандартная обработка ZX Spectrum 48K
+                return 13; // IM1: 13 T-states
+            }
+            else if (IM == 0) {
+                // IM0: if an external device supplied a vector byte on the data bus,
+                // the CPU will execute that opcode directly. We emulate a pragmatic
+                // behavior: if interrupt_vector_bus_byte is non-zero and corresponds
+                // to a RST n (0xC7/0xCF/.../0xFF) we jump to its vector; otherwise
+                // fallback to IM1 (0x0038).
+                if (interrupt_vector_bus_byte >= 0xC7 && interrupt_vector_bus_byte <= 0xFF) {
+                    // RST n - compute vector
+                    BYTE rst_index = (interrupt_vector_bus_byte - 0xC7) / 8;
+                    WORD target = (WORD)(rst_index * 8);
+                    PC = target;
+                    return 13; // treat like RST timing
+                }
+                OutputDebugStringA("IM0: no vector byte or unsupported; treating as IM1 (0x0038)\n");
+                PC = 0x0038;
+                return 13;
+            }
+            else if (IM == 2) {
+                WORD vector_addr = (I << 8) | 0xFF;
+                WORD target_pc = ReadByte(vector_addr) | (ReadByte((WORD)(vector_addr + 1)) << 8);
+                PC = target_pc;
+                return 19; // IM2: 19 T-states (vector fetch + indirect)
             }
         }
 
@@ -1653,7 +1703,6 @@ void RenderSpectrumScreen(HDC hdc, int xOffset, int yOffset) {
     StretchDIBits(hdc, xOffset, yOffset, SCREEN_WIDTH * 2, SCREEN_HEIGHT * 2, 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, pixel_buffer, &bmi, DIB_RGB_COLORS, SRCCOPY);
 }
 
-
 #ifndef BS_NOFOCUS
 #define BS_NOFOCUS 0x00008000L
 #endif
@@ -2234,7 +2283,6 @@ void LoadSpectrumFile(HWND hwnd) {
 		L"Эмулятор ZX Spectrum 48 (Z80 Core) — %s", szFile);
 	SetWindowTextW(hwnd, title);
 }
-
 
 static void PollPhysicalKeyboard(HWND hwnd) {
     if (GetForegroundWindow() != hwnd) return;
